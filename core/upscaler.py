@@ -76,6 +76,7 @@ def _get_realesrgan_scale_for_mode(original_w, original_h, mode):
         return 4  # Always 4x for best quality, can chain if needed
 
 
+
 def upscale_with_realesrgan(image_path, mode, progress_callback=None):
     """
     Upscale an image using Real-ESRGAN AI model.
@@ -143,7 +144,9 @@ def upscale_with_realesrgan(image_path, mode, progress_callback=None):
         if scale_needed > 4:
             passes_needed = 2  # 4x * 4x = 16x, enough for 8K from most images
 
-        total_progress_per_pass = 70 // passes_needed
+        # Give 85% of the progress bar to the subprocess (the real work).
+        # Post-processing (load + resize + sharpen) gets the remaining 5%.
+        total_progress_per_pass = 85 // passes_needed
 
         for pass_num in range(passes_needed):
             pass_output = os.path.join(temp_dir, f"pass{pass_num}_output.png")
@@ -161,62 +164,80 @@ def upscale_with_realesrgan(image_path, mode, progress_callback=None):
 
             if progress_callback:
                 base_progress = 10 + (pass_num * total_progress_per_pass)
-                progress_callback(base_progress + 5)
+                progress_callback(base_progress + 2)
 
             # Run Real-ESRGAN
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = 0  # SW_HIDE
 
+            # Redirect stderr to a temp file instead of PIPE.
+            # Using PIPE causes a deadlock when the 64 KB OS buffer fills
+            # up (the subprocess blocks on write, poll() never returns).
+            # A temp file avoids this entirely — no pipes, no threads needed.
+            stderr_path = os.path.join(temp_dir, f"stderr_{pass_num}.log")
+            stderr_fh = open(stderr_path, "w")
+
             process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_fh,
                 startupinfo=startupinfo,
                 cwd=os.path.dirname(exe_path)
             )
 
-            # Monitor progress (Real-ESRGAN prints progress to stderr)
+            last_reported = base_progress + 2
+            pass_start = time.time()
+            EST_DURATION = 60.0  # seconds — tuned for typical photo upscale
+
             while process.poll() is None:
                 time.sleep(0.5)
                 if progress_callback:
-                    # Increment progress while waiting
-                    current_progress = base_progress + min(
-                        total_progress_per_pass - 5,
-                        int((time.time() % 30) * 2)
-                    )
-                    progress_callback(min(current_progress, base_progress + total_progress_per_pass))
+                    elapsed = time.time() - pass_start
+                    frac = min(elapsed / EST_DURATION, 0.97)
+                    new_progress = base_progress + int(2 + frac * (total_progress_per_pass - 3))
+                    new_progress = min(new_progress, base_progress + total_progress_per_pass - 1)
+                    if new_progress > last_reported:
+                        last_reported = new_progress
+                        progress_callback(last_reported)
 
-            stdout, stderr = process.communicate()
+            process.wait()
+            stderr_fh.close()
 
             if process.returncode != 0:
-                error_msg = stderr.decode("utf-8", errors="replace")
-                raise RuntimeError(f"Real-ESRGAN failed: {error_msg}")
+                error_text = ""
+                try:
+                    with open(stderr_path, "r", errors="replace") as f:
+                        error_text = f.read()
+                except Exception:
+                    pass
+                raise RuntimeError(f"Real-ESRGAN failed (code {process.returncode}): {error_text}")
 
             if not os.path.isfile(pass_output):
                 raise RuntimeError("Real-ESRGAN did not produce output file")
 
             current_input = pass_output
-            
+
             if progress_callback:
                 progress_callback(10 + ((pass_num + 1) * total_progress_per_pass))
 
+        # ── Post-processing (95% → 100%) ──
         if progress_callback:
-            progress_callback(82)
+            progress_callback(95)
 
         # Load the AI-upscaled result
         result_img = Image.open(current_input)
         result_img = result_img.convert("RGB")
 
         if progress_callback:
-            progress_callback(88)
+            progress_callback(96)
 
         # Final resize to exact target dimensions if needed
         if result_img.size != (target_w, target_h):
             result_img = result_img.resize((target_w, target_h), Image.LANCZOS)
 
         if progress_callback:
-            progress_callback(95)
+            progress_callback(98)
 
         # Light final sharpening (AI output is already very clean)
         result_img = result_img.filter(ImageFilter.UnsharpMask(
@@ -503,6 +524,8 @@ class BatchUpscaleWorker(QThread):
         """Execute batch upscale process."""
         total = len(self.file_list)
         self.results = []
+        completed_files = 0
+        last_overall = 0  # Track highest overall to prevent going backwards
 
         for idx, file_path in enumerate(self.file_list):
             # Check for cancellation
@@ -520,11 +543,15 @@ class BatchUpscaleWorker(QThread):
             self.file_started.emit(idx, filename)
 
             try:
-                # Create progress callback for this file
-                def file_progress_cb(value, file_idx=idx):
-                    self.file_progress.emit(file_idx, value)
-                    # Calculate overall progress
-                    overall = int(((file_idx + value / 100) / total) * 100)
+                # Capture idx and completed_files by value using default args
+                # to avoid the closure-over-loop-variable bug.
+                _file_idx = idx
+                _done = completed_files
+
+                def file_progress_cb(value, _i=_file_idx, _d=_done):
+                    self.file_progress.emit(_i, value)
+                    fraction = max(0, min(value, 100)) / 100.0
+                    overall = int((_d + fraction) / total * 100)
                     self.overall_progress.emit(overall)
 
                 # Upscale the image
@@ -554,6 +581,7 @@ class BatchUpscaleWorker(QThread):
                     save_kwargs["format"] = "PNG"
 
                 result_img.save(output_path, **save_kwargs)
+                result_img.close()  # Free memory immediately
 
                 self.results.append((filename, True, f"Saved: {output_name}"))
                 self.file_completed.emit(idx, filename, True, f"Saved: {output_name}")
@@ -561,6 +589,13 @@ class BatchUpscaleWorker(QThread):
             except Exception as e:
                 self.results.append((filename, False, str(e)))
                 self.file_completed.emit(idx, filename, False, str(e))
+
+            # Increment after each file so overall never drops
+            completed_files += 1
+            overall_done = int(completed_files / total * 100)
+            if overall_done > last_overall:
+                last_overall = overall_done
+            self.overall_progress.emit(last_overall)
 
         # Update overall progress to 100 if completed
         if not self._is_cancelled:
