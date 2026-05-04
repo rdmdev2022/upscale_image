@@ -1,0 +1,24 @@
+# Real-ESRGAN binary (large, download separately)
+tools/realesrgan-ncnn-vulkan/
+tools/*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temp files
+*.tmp
